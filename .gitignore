@@ -1,0 +1,16 @@
+# Python cache
+__pycache__/
+*.pyc
+
+# IDE configs
+.idea/
+
+# Environment files
+.env
+*.env
+
+# Excel/temporary files
+*.xlsx
+*.xls
+*.docx
+*.tmp
