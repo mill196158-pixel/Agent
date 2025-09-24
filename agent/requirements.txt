@@ -1,0 +1,9 @@
+openai==1.108.0
+python-dotenv==1.1.1
+pydantic==2.11.9
+pyautocad==0.2.0
+comtypes==1.2.0
+pywinauto==0.6.8
+pyautogui==0.9.54
+Pillow==10.4.0
+psutil==6.0.0

@@ -1,0 +1,1334 @@
+﻿
+# ===== FILE: C:\Users\mill4\Рабочий стол\AI Agent\agent\config.py =====
+
+import os
+from dotenv import load_dotenv
+load_dotenv()
+
+ACAD_EXE = os.getenv("ACAD_EXE", r"C:\Program Files\Autodesk\AutoCAD 2024\acad.exe")
+SWMM_EXE = os.getenv("SWMM_EXE", r"C:\Program Files (x86)\EPA SWMM 5.2\swmm5.exe")
+
+# С‚Р°Р№РјРёРЅРіРё/РїРѕРІРµРґРµРЅРёРµ
+TYPE_DELAY = 0.03
+STEP_RETRIES = 2
+
+# ===== FILE: C:\Users\mill4\Рабочий стол\AI Agent\agent\executor.py =====
+
+import threading
+import time
+import inspect
+from typing import Dict, Any, List, Literal, Optional
+
+from .schema import Plan
+from .tools import TOOLS
+from .config import STEP_RETRIES
+from .utils.watchdog import start_watchdog
+from . import llm
+
+
+ReplanMode = Literal["never", "on_error"]
+
+
+class Executor:
+    """
+    РСЃРїРѕР»РЅСЏРµС‚ РїРѕС€Р°РіРѕРІС‹Р№ РїР»Р°РЅ (Plan), РёСЃРїРѕР»СЊР·СѓСЏ С„СѓРЅРєС†РёРё РёР· TOOLS.
+
+    РћСЃРѕР±РµРЅРЅРѕСЃС‚Рё:
+    - РђРІС‚РѕС„РёР»СЊС‚СЂР°С†РёСЏ Р°СЂРіСѓРјРµРЅС‚РѕРІ С‡РµСЂРµР· inspect.signature (СѓСЃС‚РѕР№С‡РёРІРѕСЃС‚СЊ Рє "РјСѓСЃРѕСЂРЅС‹Рј" РїРѕР»СЏРј РѕС‚ LLM)
+    - РњРЅРѕРіРѕРєСЂР°С‚РЅС‹Рµ РїРѕРїС‹С‚РєРё РІС‹РїРѕР»РЅРµРЅРёСЏ (STEP_RETRIES)
+    - Р РµРїР»Р°РЅ:
+        * "never"    вЂ” Р±РµР· СЂРµРїР»Р°РЅРѕРІ
+        * "on_error" вЂ” СЂРµРїР»Р°РЅ С‚РѕР»СЊРєРѕ РїСЂРё РїСЂРѕРІР°Р»Рµ С€Р°РіР° РёР»Рё РЅРµРїРѕРЅСЏС‚РЅРѕРј СЂРµР·СѓР»СЊС‚Р°С‚Рµ (РїРѕ СѓРјРѕР»С‡Р°РЅРёСЋ)
+    - Watchdog Рё Р±РµР·РѕРїР°СЃРЅР°СЏ РѕСЃС‚Р°РЅРѕРІРєР°
+    - РСЃС‚РѕСЂРёСЏ С€Р°РіРѕРІ self.history
+    """
+
+    def __init__(
+        self,
+        reporter=print,
+        replan_mode: ReplanMode = "on_error",
+        max_replans: int = 3,
+    ):
+        self.report = reporter
+        self._stop = threading.Event()
+        self._watchdog = None
+
+        self.replan_mode: ReplanMode = replan_mode
+        self.max_replans = max_replans
+        self._replans_done = 0
+
+        self.history: List[Dict[str, Any]] = []
+
+    # ------------------------------
+    # РџСѓР±Р»РёС‡РЅС‹Рµ РјРµС‚РѕРґС‹
+    # ------------------------------
+
+    def stop(self):
+        """РџСЂРµСЂРІР°С‚СЊ РёСЃРїРѕР»РЅРµРЅРёРµ"""
+        self._stop.set()
+
+    def run(self, plan: Plan) -> bool:
+        """Р—Р°РїСѓСЃС‚РёС‚СЊ РёСЃРїРѕР»РЅРµРЅРёРµ РїР»Р°РЅР°"""
+        self._replans_done = 0
+        self.report(f"рџљЂ РЎС‚Р°СЂС‚ РёСЃРїРѕР»РЅРµРЅРёСЏ: {plan.goal}")
+        self._watchdog = start_watchdog(self._stop, self.report)
+
+        # РЅРѕСЂРјР°Р»РёР·СѓРµРј С€Р°РіРё: pydantic.Step в†’ dict
+        remaining: List[Dict[str, Any]] = [
+            s.model_dump() if hasattr(s, "model_dump") else dict(s)
+            for s in plan.steps
+        ]
+        steps_done: List[Dict[str, Any]] = []
+
+        step_idx = 0
+        while step_idx < len(remaining):
+            if self._stop.is_set():
+                self.report("вЏ№ РћСЃС‚Р°РЅРѕРІР»РµРЅРѕ РїРѕР»СЊР·РѕРІР°С‚РµР»РµРј")
+                return False
+
+            step = remaining[step_idx]
+            tool = step.get("tool")
+            args = step.get("args", {}) or {}
+
+            ok, result = self._run_step(
+                idx=len(steps_done) + 1,
+                total_from_here=len(steps_done) + len(remaining) - step_idx,
+                tool=tool,
+                args=args,
+            )
+
+            steps_done.append({"tool": tool, "args": args, "ok": ok, "result": result})
+            self.history.append(steps_done[-1])
+
+            if not ok or not self._is_result_clear(result):
+                # РїСЂРѕРІР°Р» РёР»Рё СЂРµР·СѓР»СЊС‚Р°С‚ "РЅРµРїРѕРЅСЏС‚РЅС‹Р№"
+                if self.replan_mode == "on_error" and self._replans_done < self.max_replans:
+                    new_remaining = self._do_replan(
+                        plan.goal,
+                        steps_done,
+                        remaining[step_idx + 1 :],
+                        last_result=result,
+                    )
+                    if new_remaining is not None:
+                        remaining = remaining[: step_idx + 1] + new_remaining
+                        step_idx += 1
+                        continue
+                self.report(f"вќЊ РЁР°Рі РїСЂРѕРІР°Р»РµРЅ РёР»Рё РЅРµРїРѕРЅСЏС‚РµРЅ: {tool}")
+                return False
+
+            step_idx += 1
+
+        self.report("вњ… Р’С‹РїРѕР»РЅРµРЅРѕ")
+        return True
+
+    # ------------------------------
+    # Р’РЅСѓС‚СЂРµРЅРЅРёРµ РјРµС‚РѕРґС‹
+    # ------------------------------
+
+    def _normalize_args(self, fn, args: Dict[str, Any]) -> Dict[str, Any]:
+        """РћС‚СЃРµС‡СЊ Р»РёС€РЅРёРµ Р°СЂРіСѓРјРµРЅС‚С‹ РѕС‚ LLM (СѓСЃС‚РѕР№С‡РёРІРѕСЃС‚СЊ Рє РјСѓСЃРѕСЂСѓ)"""
+        try:
+            sig = inspect.signature(fn)
+            allowed = sig.parameters.keys()
+            return {k: v for k, v in args.items() if k in allowed}
+        except Exception:
+            return args
+
+    def _is_result_clear(self, result: Dict[str, Any]) -> bool:
+        """
+        РџСЂРѕРІРµСЂРєР°: РїРѕРЅСЏС‚РЅС‹Р№ Р»Рё СЂРµР·СѓР»СЊС‚Р°С‚.
+        - ok=False в†’ РЅРµРїРѕРЅСЏС‚РЅРѕ
+        - РµСЃС‚СЊ reason=... в†’ С‚РѕР¶Рµ РїРѕРґРѕР·СЂРёС‚РµР»СЊРЅРѕ, РїСЂРѕСЃРёРј LLM СѓС‚РѕС‡РЅРёС‚СЊ
+        """
+        if not isinstance(result, dict):
+            return False
+        if not result.get("ok", False):
+            return False
+        if "reason" in result and result.get("reason"):
+            return False
+        return True
+
+    def _run_step(self, idx: int, total_from_here: int, tool: str, args: Dict[str, Any]):
+        """Р’С‹РїРѕР»РЅРёС‚СЊ РѕРґРёРЅ С€Р°Рі"""
+        self.report(f" [{idx}/~{idx+total_from_here-1}] {tool} {args}")
+        fn = TOOLS.get(tool)
+        if not fn:
+            return False, {"error": f"unknown tool {tool}"}
+
+        last_err = None
+        for attempt in range(1, STEP_RETRIES + 1):
+            try:
+                safe_args = self._normalize_args(fn, args or {})
+                res = fn(**safe_args)
+                if not (isinstance(res, dict) and res.get("ok")):
+                    raise RuntimeError(f"step returned {res}")
+                self.report(f"  в†’ ok ({attempt})")
+                return True, res
+            except Exception as e:
+                last_err = str(e)
+                self.report(f"  ! РѕС€РёР±РєР° РїРѕРїС‹С‚РєР° {attempt}: {e}")
+                time.sleep(0.4)
+
+        return False, {"error": last_err}
+
+    def _do_replan(
+        self,
+        goal: str,
+        steps_done: List[Dict[str, Any]],
+        remaining_steps: List[Dict[str, Any]],
+        last_result: Dict[str, Any],
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Р’С‹РїРѕР»РЅРёС‚СЊ СЂРµРїР»Р°РЅРёСЂРѕРІР°РЅРёРµ (СЃ С‡С‚РµРЅРёРµРј СЃРІРµР¶РµРіРѕ РєРѕРЅС‚РµРєСЃС‚Р° РёР· AutoCAD). Р’РµСЂРЅСѓС‚СЊ РЅРѕРІС‹Р№ remaining РёР»Рё None."""
+        try:
+            doc_info = TOOLS.get("acad.get_current_doc_info", lambda: {"ok": False})()
+            extents = TOOLS.get("acad.get_extents_of_model", lambda: {"ok": False})()
+
+            obs = {
+                "last_result": last_result,
+                "doc": doc_info.get("doc") if isinstance(doc_info, dict) and doc_info.get("ok") else None,
+                "extents": extents if isinstance(extents, dict) and extents.get("ok") else None,
+            }
+
+            new_remaining = llm.replan(
+                goal=goal,
+                steps_done=steps_done,
+                remaining_steps=remaining_steps,
+                observation=obs,
+            )
+            if isinstance(new_remaining, list):
+                self._replans_done += 1
+                self.report(
+                    f"рџ”Ѓ Р РµРїР»Р°РЅ РІС‹РїРѕР»РЅРµРЅ: РЅРѕРІС‹С… С€Р°РіРѕРІ {len(new_remaining)} "
+                    f"(СЂРµРїР»Р°РЅ {self._replans_done}/{self.max_replans})"
+                )
+                return new_remaining
+            return None
+        except Exception as e:
+            self.report(f"в„№пёЏ Р РµРїР»Р°РЅ РїСЂРѕРїСѓС‰РµРЅ: {e}")
+            return None
+
+# ===== FILE: C:\Users\mill4\Рабочий стол\AI Agent\agent\llm.py =====
+
+import os
+import json
+from openai import OpenAI
+from dotenv import load_dotenv
+from .schema import Plan, validate_plan
+
+load_dotenv()
+_client = OpenAI(
+    api_key=os.getenv("OPENAI_API_KEY"),
+    project=os.getenv("OPENAI_PROJECT_ID"),
+)
+
+# -----------------------
+# SYSTEM PROMPT
+# -----------------------
+_SYSTEM_PROMPT = """
+РўС‹ РёРЅР¶РµРЅРµСЂРЅС‹Р№ Р°РіРµРЅС‚-РїР»Р°РЅРёСЂРѕРІС‰РёРє.  
+Р—Р°РґР°С‡Р°: РїСЂРµРѕР±СЂР°Р·РѕРІР°С‚СЊ Р·Р°РїСЂРѕСЃ РїРѕР»СЊР·РѕРІР°С‚РµР»СЏ РІ JSON-РїР»Р°РЅ.
+
+РџРµСЂРµРґ Р»СЋР±С‹РјРё РіРµРѕРјРµС‚СЂРёС‡РµСЃРєРёРјРё РґРµР№СЃС‚РІРёСЏРјРё:
+1) Р’РЎР•Р“Р”Рђ РІС‹Р·РІР°С‚СЊ acad.get_current_doc_info
+2) РџРѕС‚РѕРј acad.get_extents_of_model (РµСЃР»Рё РїСѓСЃС‚Рѕ вЂ” РїСЂРѕРґРѕР»Р¶Р°Р№ Р±РµР· РЅРµРіРѕ РёР»Рё СЃРѕР·РґР°Р№ Р±Р°Р·РѕРІСѓСЋ С„РёРіСѓСЂСѓ)
+
+Р”РѕСЃС‚СѓРїРЅС‹Рµ РёРЅСЃС‚СЂСѓРјРµРЅС‚С‹ Рё РёС… Р°СЂРіСѓРјРµРЅС‚С‹ (РЅРёС‡РµРіРѕ Р»РёС€РЅРµРіРѕ):
+- acad.get_current_doc_info()
+- acad.get_extents_of_model()
+- acad.snapshot_model(limit:int)
+- acad.list_layers()
+- acad.list_entities(limit:int, layer?:str, type_contains?:str)
+- acad.ensure_layer(name:str, color:int|str)
+- acad.set_current_layer(name:str)
+- acad.draw_line(start:[x,y], end:[x,y], layer?:str)
+- acad.draw_polyline(points:[[x,y],...], layer?:str, closed?:bool)
+- acad.draw_rectangle(base:[x,y], width:float, height:float, layer?:str)
+- acad.draw_circle(center:[x,y], radius:float, layer?:str)
+- acad.draw_from_model_center(shape:str, size:float, layer?:str)
+- acad.draw_triangle_roof_over_largest_square(layer_source?:str, layer_result?:str, height_ratio?:float, overhang?:float)
+- acad.measure_bbox_of_largest_closed(layer?:str)
+- acad.erase_all_on_layer(layer:str)
+- acad.erase_by_filter(type_contains?:str, layer?:str, limit?:int)
+- acad.save_as(path:str)
+- acad.zoom_extents()
+- swmm.run_cli(inp_path:str)
+
+вљ пёЏ РџСЂР°РІРёР»Р°:
+- РџРёС€Рё СЃС‚СЂРѕРіРѕ JSON РїРѕ СЃС…РµРјРµ:
+{
+  "goal": "<РєСЂР°С‚РєР°СЏ С†РµР»СЊ>",
+  "steps": [
+    {"tool": "<РёРјСЏ>", "args": {...}},
+    ...
+  ]
+}
+- РќРёРєР°РєРѕРіРѕ С‚РµРєСЃС‚Р° РёР»Рё РєРѕРјРјРµРЅС‚Р°СЂРёРµРІ РІРЅРµ JSON.
+- РќРёРєР°РєРёС… Р»РёС€РЅРёС… Р°СЂРіСѓРјРµРЅС‚РѕРІ, С‚РѕР»СЊРєРѕ СѓРєР°Р·Р°РЅРЅС‹Рµ РІС‹С€Рµ.
+"""
+
+# -----------------------
+# REPLANNER PROMPT
+# -----------------------
+_REPLANNER_PROMPT = """
+РўС‹ Р°РіРµРЅС‚-РґРѕРїР»Р°РЅРёСЂРѕРІС‰РёРє. Р¦РµР»СЊ РїРѕР»СЊР·РѕРІР°С‚РµР»СЏ РЅРµРёР·РјРµРЅРЅР°.
+
+Р’С…РѕРґРЅС‹Рµ РґР°РЅРЅС‹Рµ:
+- steps_done: СѓР¶Рµ РІС‹РїРѕР»РЅРµРЅРЅС‹Рµ С€Р°РіРё
+- remaining_steps: РѕСЃС‚Р°РІС€РёРµСЃСЏ С€Р°РіРё
+- observation: СЂРµР·СѓР»СЊС‚Р°С‚ РїРѕСЃР»РµРґРЅРµРіРѕ С€Р°РіР° + РєСЂР°С‚РєРёР№ РєРѕРЅС‚РµРєСЃС‚ (doc, extents)
+
+Р—Р°РґР°С‡Р°: РІРµСЂРЅСѓС‚СЊ РЅРѕРІС‹Р№ СЃРїРёСЃРѕРє РѕСЃС‚Р°РІС€РёС…СЃСЏ С€Р°РіРѕРІ РІ С„РѕСЂРјР°С‚Рµ:
+{ "steps": [ {"tool":"...", "args":{...}}, ... ] }
+
+вљ пёЏ РџСЂР°РІРёР»Р°:
+- РќР• РїРѕРІС‚РѕСЂСЏР№ steps_done.
+- Р•СЃР»Рё РєРѕРЅС‚РµРєСЃС‚ РёР·РјРµРЅРёР»СЃСЏ, РґРѕР±Р°РІСЊ РІС‹Р·РѕРІС‹ acad.get_current_doc_info РёР»Рё acad.get_extents_of_model.
+- Р¤РѕСЂРјР°С‚ СЃС‚СЂРѕРіРѕ JSON, Р±РµР· РєРѕРјРјРµРЅС‚Р°СЂРёРµРІ Рё С‚РµРєСЃС‚Р°.
+"""
+
+def interpret(task_text: str) -> Plan:
+    """РРЅС‚РµСЂРїСЂРµС‚Р°С†РёСЏ Р·Р°РґР°С‡Рё РІ JSON-РїР»Р°РЅ"""
+    models = ["gpt-5-mini", "gpt-4o-mini"]
+    last_err = None
+
+    for model in models:
+        try:
+            resp = _client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": _SYSTEM_PROMPT},
+                    {"role": "user", "content": task_text},
+                ],
+            )
+            raw = resp.choices[0].message.content.strip()
+            data = json.loads(raw)
+            plan = validate_plan(data)
+            print(f"вљЎ РСЃРїРѕР»СЊР·РѕРІР°РЅР° РјРѕРґРµР»СЊ: {model}")
+            return plan
+        except Exception as e:
+            last_err = e
+            print(f"вљ пёЏ {model} РЅРµРґРѕСЃС‚СѓРїРЅР°: {e}")
+            continue
+
+    raise RuntimeError(f"РќРµС‚ РґРѕСЃС‚СѓРїРЅРѕР№ РјРѕРґРµР»Рё: {last_err}")
+
+def replan(goal: str, steps_done: list, remaining_steps: list, observation: dict) -> list:
+    """Р—Р°РїСЂРѕСЃ Рє LLM РЅР° РєРѕСЂСЂРµРєС‚РёСЂРѕРІРєСѓ РѕСЃС‚Р°РІС€РёС…СЃСЏ С€Р°РіРѕРІ"""
+    models = ["gpt-5-mini", "gpt-4o-mini"]
+    payload = {
+        "goal": goal,
+        "steps_done": steps_done,
+        "remaining_steps": remaining_steps,
+        "observation": observation,
+    }
+
+    for model in models:
+        try:
+            resp = _client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": _REPLANNER_PROMPT},
+                    {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+                ],
+            )
+            raw = resp.choices[0].message.content.strip()
+            data = json.loads(raw)
+            steps = data.get("steps", [])
+            print(f"рџ”Ѓ Р РµРїР»Р°РЅ СЃ РјРѕРґРµР»СЊСЋ: {model}, РѕСЃС‚Р°Р»РѕСЃСЊ С€Р°РіРѕРІ: {len(steps)}")
+            return steps
+        except Exception as e:
+            print(f"вљ пёЏ replan: {model} РЅРµРґРѕСЃС‚СѓРїРЅР°: {e}")
+            continue
+
+    return remaining_steps
+
+# ===== FILE: C:\Users\mill4\Рабочий стол\AI Agent\agent\run_cli.py =====
+
+from agent.llm import interpret
+from agent.executor import Executor
+from json import dumps
+
+if __name__ == "__main__":
+    print("Р’РІРµРґРёС‚Рµ Р·Р°РґР°С‡Сѓ (РїСЂРёРјРµСЂ: РќР°СЂРёСЃСѓР№ РєРІР°РґСЂР°С‚ 1000x1000 РІ AutoCAD РЅР° СЃР»РѕРµ Pipes):")
+    task = input("> ").strip() or "РќР°СЂРёСЃСѓР№ РєРІР°РґСЂР°С‚ 1000x1000 РІ AutoCAD РЅР° СЃР»РѕРµ Pipes"
+
+    # РїРѕР»СѓС‡Р°РµРј РїР»Р°РЅ РѕС‚ LLM
+    plan = interpret(task)
+
+    print("\n=== РџР»Р°РЅ ===")
+    print(dumps(plan.model_dump(), indent=2, ensure_ascii=False))
+
+    print("\n=== РСЃРїРѕР»РЅРµРЅРёРµ ===")
+    # РІР°СЂРёР°РЅС‚С‹:
+    #   replan_mode="never"     в†’ Р±РµР· СЂРµРїР»Р°РЅРѕРІ
+    #   replan_mode="on_error"  в†’ СЂРµРїР»Р°РЅ С‚РѕР»СЊРєРѕ РїСЂРё РѕС€РёР±РєРµ (СЂРµРєРѕРјРµРЅРґСѓРµС‚СЃСЏ)
+    #   replan_mode="each_step" в†’ СЂРµРїР»Р°РЅ РїРѕСЃР»Рµ РєР°Р¶РґРѕРіРѕ С€Р°РіР°
+    executor = Executor(replan_mode="on_error", max_replans=3)
+    executor.run(plan)
+
+# ===== FILE: C:\Users\mill4\Рабочий стол\AI Agent\agent\schema.py =====
+
+from pydantic import BaseModel, Field, ValidationError
+from typing import List, Dict, Any
+
+class Step(BaseModel):
+    tool: str
+    args: Dict[str, Any] = Field(default_factory=dict)
+
+class Plan(BaseModel):
+    goal: str
+    steps: List[Step]
+
+def validate_plan(raw: dict) -> Plan:
+    return Plan(**raw)
+
+# ===== FILE: C:\Users\mill4\Рабочий стол\AI Agent\agent\test_openai.py =====
+
+import os
+from dotenv import load_dotenv
+from openai import OpenAI
+
+# Р—Р°РіСЂСѓР¶Р°РµРј РєР»СЋС‡Рё РёР· .env
+load_dotenv()
+
+api_key = os.getenv("OPENAI_API_KEY")
+project_id = os.getenv("OPENAI_PROJECT_ID")
+
+if not api_key:
+    raise ValueError("вќЊ РљР»СЋС‡ РЅРµ РЅР°Р№РґРµРЅ РІ .env")
+if not project_id:
+    raise ValueError("вќЊ Project ID РЅРµ РЅР°Р№РґРµРЅ РІ .env")
+
+# РЎРѕР·РґР°С‘Рј РєР»РёРµРЅС‚Р° СЃ РїСЂРѕРµРєС‚РѕРј
+client = OpenAI(api_key=api_key, project=project_id)
+
+# РџСЂРѕР±РЅС‹Р№ Р·Р°РїСЂРѕСЃ
+resp = client.chat.completions.create(
+    model="gpt-5-mini",   # РґРµС€С‘РІР°СЏ РјРѕРґРµР»СЊ РґР»СЏ С‚РµСЃС‚РѕРІ
+    messages=[
+        {"role": "system", "content": "РўС‹ РїРѕРјРѕС‰РЅРёРє, РѕС‚РІРµС‡Р°Р№ РѕС‡РµРЅСЊ РєСЂР°С‚РєРѕ."},
+        {"role": "user", "content": "РќР°РїРёС€Рё С„РѕСЂРјСѓР»Сѓ РІРѕРґС‹"}
+    ]
+)
+
+print("вњ… РћС‚РІРµС‚:", resp.choices[0].message.content)
+
+# ===== FILE: C:\Users\mill4\Рабочий стол\AI Agent\agent\tools\__init__.py =====
+
+from . import acad as _acad
+from . import swmm as _swmm
+
+TOOLS = {
+    # AutoCAD вЂ“ СЂРёСЃРѕРІР°РЅРёРµ
+    "acad.ensure_layer": _acad.ensure_layer,
+    "acad.set_current_layer": _acad.set_current_layer,
+    "acad.draw_line": _acad.draw_line,
+    "acad.draw_polyline": _acad.draw_polyline,
+    "acad.draw_rectangle": _acad.draw_rectangle,
+    "acad.draw_circle": _acad.draw_circle,
+    "acad.zoom_extents": _acad.zoom_extents,
+    "acad.save_as": _acad.save_as,
+
+    # AutoCAD вЂ“ С‡С‚РµРЅРёРµ/Р°РЅР°Р»РёС‚РёРєР°
+    "acad.get_current_doc_info": _acad.get_current_doc_info,
+    "acad.snapshot_model": _acad.snapshot_model,
+    "acad.list_layers": _acad.list_layers,
+    "acad.list_entities": _acad.list_entities,
+    "acad.get_extents_of_model": _acad.get_extents_of_model,
+    "acad.get_center_of_model": _acad.get_center_of_model,
+    "acad.find_closed_polylines": _acad.find_closed_polylines,
+    "acad.pick_largest_closed_polyline": _acad.pick_largest_closed_polyline,
+    "acad.measure_bbox_of_largest_closed": _acad.measure_bbox_of_largest_closed,
+    "acad.draw_from_model_center": _acad.draw_from_model_center,
+    "acad.draw_triangle_roof_over_largest_square": _acad.draw_triangle_roof_over_largest_square,
+
+    # AutoCAD вЂ“ СѓРґР°Р»РµРЅРёРµ
+    "acad.erase_by_handles": _acad.erase_by_handles,
+    "acad.erase_all_on_layer": _acad.erase_all_on_layer,
+    "acad.erase_by_filter": _acad.erase_by_filter,
+
+    # SWMM
+    "swmm.run_cli": _swmm.run_cli,
+}
+
+# ===== FILE: C:\Users\mill4\Рабочий стол\AI Agent\agent\tools\acad.py =====
+
+from __future__ import annotations
+from typing import List, Tuple, Dict, Any, Optional, Iterable, Set
+import math
+import time
+
+from pyautocad import Autocad, APoint, aDouble
+
+# =====================================================
+# РќРђРЎРўР РћР™РљР / РўРћР§РќРћРЎРўР
+# =====================================================
+
+# РіРµРѕРјРµС‚СЂРёС‡РµСЃРєРёРµ РґРѕРїСѓСЃРєРё РїРѕ СѓРјРѕР»С‡Р°РЅРёСЋ
+_POS_TOL = 1e-6            # РґРѕРїСѓСЃРє РЅР° СЃРѕРІРїР°РґРµРЅРёРµ С‚РѕС‡РµРє (РµРґРёРЅРёС†С‹ С‡РµСЂС‚РµР¶Р°)
+_ANG_TOL_DEG = 1.0         # РґРѕРїСѓСЃРє РЅР° РїСЂСЏРјРѕР№ СѓРіРѕР» (РІ РіСЂР°РґСѓСЃР°С…)
+_REL_LEN_TOL = 0.02        # РѕС‚РЅРѕСЃРёС‚РµР»СЊРЅС‹Р№ РґРѕРїСѓСЃРє СЂР°РІРµРЅСЃС‚РІР° СЃС‚РѕСЂРѕРЅ (2%)
+_MIN_SIDE = 1e-6           # РјРёРЅРёРјР°Р»СЊРЅР°СЏ СЃС‚РѕСЂРѕРЅР° РєРІР°РґСЂР°С‚Р° (С‡С‚РѕР±С‹ РѕС‚СЃРµСЏС‚СЊ РјСѓСЃРѕСЂ)
+
+# =====================================================
+# Р’РќРЈРўР Р•РќРќРР• РҐР•Р›РџР•Р Р«: COM/AutoCAD
+# =====================================================
+
+def _get_acad(retries: int = 5, sleep_sec: float = 0.2) -> Autocad:
+    """РЎРѕР·РґР°РµС‚/РІРѕР·РІСЂР°С‰Р°РµС‚ РїРѕРґРєР»СЋС‡РµРЅРёРµ Рє AutoCAD С‡РµСЂРµР· COM (СЃ СЂРµС‚СЂР°СЏРјРё)."""
+    last_err = None
+    for _ in range(retries):
+        try:
+            return Autocad(create_if_not_exists=True)
+        except Exception as e:
+            last_err = e
+            time.sleep(sleep_sec)
+    # РµСЃР»Рё СѓРїРѕСЂРЅРѕ РЅРµ СѓРґР°С‘С‚СЃСЏ вЂ” РїСЂРѕР±СЂРѕСЃРёРј РёСЃРєР»СЋС‡РµРЅРёРµ
+    raise RuntimeError(f"AutoCAD COM init failed: {last_err}")
+
+def _doc():
+    return _get_acad().doc
+
+def _ms():
+    return _doc().ModelSpace
+
+def _object_name(e) -> str:
+    try:
+        name = getattr(e, "ObjectName", "") or ""
+        return str(name)
+    except Exception:
+        return ""
+
+def _is_type(e, contains: str) -> bool:
+    return contains.lower() in _object_name(e).lower()
+
+# =====================================================
+# Р’РќРЈРўР Р•РќРќРР• РҐР•Р›РџР•Р Р«: Р“Р•РћРњР•РўР РРЇ
+# =====================================================
+
+def _dist(p: Tuple[float, float], q: Tuple[float, float]) -> float:
+    return math.hypot(p[0] - q[0], p[1] - q[1])
+
+def _near(a: float, b: float, rel_tol: float = _REL_LEN_TOL, abs_tol: float = _POS_TOL) -> bool:
+    if abs(a - b) <= abs_tol:
+        return True
+    # Р·Р°С‰РёС‚Р° РѕС‚ РґРµР»РµРЅРёСЏ РЅР° 0
+    m = max(abs(a), abs(b), abs_tol)
+    return abs(a - b) / m <= rel_tol
+
+def _angle_deg(a: Tuple[float, float], b: Tuple[float, float], c: Tuple[float, float]) -> float:
+    """РЈРіРѕР» ABC РІ РіСЂР°РґСѓСЃР°С…."""
+    v1 = (a[0]-b[0], a[1]-b[1])
+    v2 = (c[0]-b[0], c[1]-b[1])
+    n1 = math.hypot(*v1) or 1.0
+    n2 = math.hypot(*v2) or 1.0
+    v1 = (v1[0]/n1, v1[1]/n1)
+    v2 = (v2[0]/n2, v2[1]/n2)
+    dot = max(-1.0, min(1.0, v1[0]*v2[0] + v1[1]*v2[1]))
+    return math.degrees(math.acos(dot))
+
+def _bbox_from_points_3d(pts3: List[Tuple[float, float, float]]):
+    if not pts3:
+        return None
+    xs = [p[0] for p in pts3]; ys = [p[1] for p in pts3]; zs = [p[2] for p in pts3]
+    return ( (min(xs), min(ys), min(zs)), (max(xs), max(ys), max(zs)) )
+
+def _bbox_from_points_2d(pts2: List[Tuple[float, float]]):
+    if not pts2:
+        return None
+    xs = [p[0] for p in pts2]; ys = [p[1] for p in pts2]
+    return ( (min(xs), min(ys)), (max(xs), max(ys)) )
+
+def _poly_area_xy(pts2: List[Tuple[float, float]]) -> float:
+    if len(pts2) < 3:
+        return 0.0
+    s = 0.0
+    n = len(pts2)
+    for i in range(n):
+        x1, y1 = pts2[i]
+        x2, y2 = pts2[(i + 1) % n]
+        s += x1 * y2 - x2 * y1
+    return abs(s) * 0.5
+
+def _centroid(pts2: List[Tuple[float, float]]):
+    """Р¦РµРЅС‚СЂРѕРёРґ РјРЅРѕРіРѕСѓРіРѕР»СЊРЅРёРєР° (РґР»СЏ РІС‹РїСѓРєР»С‹С… СЃС‚Р°Р±РёР»СЊРЅРµРµ)."""
+    a = _poly_area_xy(pts2)
+    if a <= _POS_TOL:
+        # fallback: РїСЂРѕСЃС‚Рѕ СЃСЂРµРґРЅРµРµ
+        x = sum(p[0] for p in pts2) / len(pts2)
+        y = sum(p[1] for p in pts2) / len(pts2)
+        return (x, y)
+    cx = 0.0; cy = 0.0
+    n = len(pts2)
+    for i in range(n):
+        x1, y1 = pts2[i]
+        x2, y2 = pts2[(i + 1) % n]
+        cross = x1*y2 - x2*y1
+        cx += (x1 + x2) * cross
+        cy += (y1 + y2) * cross
+    cx /= (6.0 * a)
+    cy /= (6.0 * a)
+    return (cx, cy)
+
+def _is_square_vertices(verts: List[Tuple[float, float]],
+                        ang_tol_deg: float = _ANG_TOL_DEG,
+                        rel_len_tol: float = _REL_LEN_TOL,
+                        min_side: float = _MIN_SIDE) -> bool:
+    """РџСЂРѕРІРµСЂСЏРµС‚, С‡С‚Рѕ 4 РІРµСЂС€РёРЅС‹ РѕР±СЂР°Р·СѓСЋС‚ РєРІР°РґСЂР°С‚ (РїРѕСЂСЏРґРѕРє РїРѕ РєРѕРЅС‚СѓСЂСѓ!)."""
+    if len(verts) != 4:
+        return False
+    # СЃС‚РѕСЂРѕРЅС‹
+    sides = [
+        _dist(verts[0], verts[1]),
+        _dist(verts[1], verts[2]),
+        _dist(verts[2], verts[3]),
+        _dist(verts[3], verts[0]),
+    ]
+    if any(s < min_side for s in sides):
+        return False
+    # СЂР°РІРµРЅСЃС‚РІРѕ СЃС‚РѕСЂРѕРЅ
+    s_mean = sum(sides) / 4.0
+    if any(not _near(s, s_mean, rel_tol=rel_len_tol) for s in sides):
+        return False
+    # СѓРіР»С‹ в‰€ 90В°
+    angs = [
+        _angle_deg(verts[3], verts[0], verts[1]),
+        _angle_deg(verts[0], verts[1], verts[2]),
+        _angle_deg(verts[1], verts[2], verts[3]),
+        _angle_deg(verts[2], verts[3], verts[0]),
+    ]
+    if any(abs(a - 90.0) > ang_tol_deg for a in angs):
+        return False
+    return True
+
+def _order_loop(points: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
+    """РЈРїРѕСЂСЏРґРѕС‡РёС‚СЊ 4 С‚РѕС‡РєРё РїРѕ РєРѕРЅС‚СѓСЂСѓ (РґР»СЏ РЅР°Р±РѕСЂРѕРІ РёР· Р»РёРЅРёР№). РџСЂРѕСЃС‚РѕР№ СЃРїРѕСЃРѕР±: РЅР°С‡Р°С‚СЊ СЃ Р»РµРІРѕР№-РЅРёР¶РЅРµР№ Рё РёРґС‚Рё РїРѕ Р±Р»РёР¶РЅРµРјСѓ."""
+    if len(points) != 4:
+        return points
+    pts = points[:]
+    # СЃС‚Р°СЂС‚: Р»РµРІР°СЏ-РЅРёР·РЅСЏСЏ
+    pts.sort(key=lambda p: (p[0], p[1]))
+    start = pts[0]
+    rest = pts[1:]
+    # РІС‹Р±РµСЂРµРј РґРІР° Р±Р»РёР¶Р°Р№С€РёС… С€Р°РіР° РїРѕ РїРµСЂРёРјРµС‚СЂСѓ
+    # Р¶Р°РґРЅРѕ: РІС‹Р±РёСЂР°РµРј Р±Р»РёР¶Р°Р№С€СѓСЋ, РїРѕС‚РѕРј СЃРЅРѕРІР° Р±Р»РёР¶Р°Р№С€СѓСЋ Рє РїРѕСЃР»РµРґРЅРµР№
+    ordered = [start]
+    current = start
+    for _ in range(3):
+        rest.sort(key=lambda p: _dist(current, p))
+        nxt = rest.pop(0)
+        ordered.append(nxt)
+        current = nxt
+    return ordered
+
+# =====================================================
+# Р’Р«РўРЇР“РР’РђРќРР• Р“Р•РћРњР•РўР РР РР— ENTITIES
+# =====================================================
+
+def _coords_from_polyline(e) -> List[Tuple[float, float, float]]:
+    """Р”РѕСЃС‚Р°С‚СЊ РєРѕРѕСЂРґРёРЅР°С‚С‹ РёР· Polyline/LWPolyline РєР°Рє СЃРїРёСЃРѕРє (x,y,z)."""
+    # РџС‹С‚Р°РµРјСЃСЏ РєР°Рє 3D
+    try:
+        arr = list(e.Coordinates)  # x,y,z,x,y,z...
+        pts = [(float(arr[i]), float(arr[i+1]), float(arr[i+2])) for i in range(0, len(arr), 3)]
+        return pts
+    except Exception:
+        pass
+    # РџС‹С‚Р°РµРјСЃСЏ РєР°Рє 2D
+    try:
+        arr = list(e.Coordinates)
+        pts2d = [(float(arr[i]), float(arr[i+1]), 0.0) for i in range(0, len(arr), 2)]
+        return pts2d
+    except Exception:
+        return []
+
+def _polyline_is_closed(e) -> bool:
+    try:
+        return bool(e.Closed)
+    except Exception:
+        # РїСЂРѕРІРµСЂРёРј РїРѕ РїРµСЂРІРѕР№/РїРѕСЃР»РµРґРЅРµР№ С‚РѕС‡РєРµ
+        pts3 = _coords_from_polyline(e)
+        if pts3:
+            return (abs(pts3[0][0]-pts3[-1][0]) <= _POS_TOL) and (abs(pts3[0][1]-pts3[-1][1]) <= _POS_TOL)
+        return False
+
+def _polyline_vertices_2d_ordered(e) -> List[Tuple[float, float]]:
+    pts3 = _coords_from_polyline(e)
+    if not pts3:
+        return []
+    pts2 = [(p[0], p[1]) for p in pts3]
+    # РµСЃР»Рё РґСѓР±Р»РёСЂСѓРµС‚СЃСЏ РїРѕСЃР»РµРґРЅСЏСЏ С‚РѕС‡РєР° вЂ” СѓР±РµСЂС‘Рј
+    if len(pts2) >= 2 and _dist(pts2[0], pts2[-1]) <= _POS_TOL:
+        pts2 = pts2[:-1]
+    return pts2
+
+def _get_bbox_entity(e):
+    """РџРѕРїС‹С‚Р°С‚СЊСЃСЏ РїРѕР»СѓС‡РёС‚СЊ bbox РґР»СЏ РѕР±СЉРµРєС‚Р° e."""
+    name = _object_name(e)
+    # Polyline
+    if "polyline" in name.lower():
+        pts3 = _coords_from_polyline(e)
+        return _bbox_from_points_3d(pts3)
+    # Line
+    if "line" in name.lower() and "polyline" not in name.lower():
+        try:
+            sp = e.StartPoint; ep = e.EndPoint
+            return _bbox_from_points_3d([(float(sp[0]), float(sp[1]), float(sp[2])),
+                                         (float(ep[0]), float(ep[1]), float(ep[2]))])
+        except Exception:
+            return None
+    # Circle
+    if "circle" in name.lower():
+        try:
+            c = e.Center; r = float(e.Radius)
+            return ((c[0]-r, c[1]-r, 0.0), (c[0]+r, c[1]+r, 0.0))
+        except Exception:
+            return None
+    # Hatch/Solid/BlockRef вЂ” РїРѕРїС‹С‚Р°РµРјСЃСЏ С‡РµСЂРµР· bounding box РїРѕ РєРѕРѕСЂРґРёРЅР°С‚Р°Рј/РјРµС‚РѕРґСѓ
+    # Try COM: GetBoundingBox (РјРѕР¶РµС‚ РЅРµ СЂР°Р±РѕС‚Р°С‚СЊ РѕРґРёРЅР°РєРѕРІРѕ РІРѕ РІСЃРµС… РІРµСЂСЃРёСЏС…)
+    try:
+        # pyautocad РјРѕР¶РµС‚ РЅРµ РїРѕРґРґРµСЂР¶Р°С‚СЊ СЃСЃС‹Р»РѕС‡РЅС‹Рµ РїР°СЂР°РјРµС‚СЂС‹,
+        # РїРѕСЌС‚РѕРјСѓ РїСЂРѕСЃС‚Рѕ РїРѕРїСЂРѕР±СѓРµРј РґРѕСЃС‚СѓРї Рє Extents (РЅРµ РІСЃРµРіРґР° РµСЃС‚СЊ)
+        # fallback: РЅРµС‚ вЂ” РІРµСЂРЅС‘Рј None
+        if hasattr(e, "GetBoundingBox"):
+            # РїРѕРїС‹С‚РєР° вЂ” РЅРµ РІРµР·РґРµ РєРѕСЂСЂРµРєС‚РЅРѕ СЂР°Р±РѕС‚Р°РµС‚ С‡РµСЂРµР· python
+            # РѕСЃС‚Р°РІРёРј РєР°Рє РїРѕС‚РµРЅС†РёР°Р»СЊРЅС‹Р№ С…СѓРє, РЅРѕ Р±РµР· Р¶С‘СЃС‚РєРѕР№ Р·Р°РІРёСЃРёРјРѕСЃС‚Рё
+            pass
+    except Exception:
+        pass
+    return None
+
+# =====================================================
+# Р‘РђР—РћР’Р«Р• Р РРЎРћР’РђР›РљР
+# =====================================================
+
+def _color_to_aci(color: Any) -> int:
+    """РџСЂРµРѕР±СЂР°Р·РѕРІР°С‚СЊ СЃС‚СЂРѕРєРѕРІС‹Р№ С†РІРµС‚ РІ ACI РёР»Рё РїСЂРѕРїСѓСЃС‚РёС‚СЊ int."""
+    if isinstance(color, int):
+        return color
+    if isinstance(color, str):
+        c = color.strip().lower()
+        table = {
+            "red": 1, "Р¶РµР»С‚С‹Р№": 2, "yellow": 2, "green": 3, "cyan": 4,
+            "blue": 5, "magenta": 6, "white": 7, "black": 7,
+        }
+        return table.get(c, 7)
+    return 7
+
+def ensure_layer(name: str, color: Any = 3, **kwargs):
+    acad = _get_acad()
+    layers = acad.doc.Layers
+    try:
+        layer = layers.Item(name)
+    except Exception:
+        layer = layers.Add(name)
+    # РїРѕРїС‹С‚РєР° РІС‹СЃС‚Р°РІРёС‚СЊ С†РІРµС‚
+    try:
+        layer.Color = _color_to_aci(color)
+    except Exception:
+        pass
+    return {"ok": True, "layer": name}
+
+def set_current_layer(name: str, **kwargs):
+    acad = _get_acad()
+    acad.doc.ActiveLayer = acad.doc.Layers.Item(name)
+    return {"ok": True, "layer": name}
+
+def _to_3d_flat(points_2d: List[Tuple[float, float]]) -> List[float]:
+    flat: List[float] = []
+    for x, y in points_2d:
+        flat.extend([float(x), float(y), 0.0])
+    return flat
+
+def draw_line(start: Tuple[float, float], end: Tuple[float, float], layer: str | None = None, **kwargs):
+    ms = _ms()
+    e = ms.AddLine(APoint(float(start[0]), float(start[1])),
+                   APoint(float(end[0]), float(end[1])))
+    if layer:
+        e.Layer = layer
+    time.sleep(0.02)
+    return {"ok": True, "handle": getattr(e, "Handle", None)}
+
+def draw_polyline(points: List[Tuple[float, float]],
+                  layer: str | None = None,
+                  closed: bool = True,
+                  **kwargs):
+    """РЎРѕР·РґР°РµС‚ РїРѕР»РёР»РёРЅРёСЋ РїРѕ С‚РѕС‡РєР°Рј. Р•СЃР»Рё closed Рё РєРѕРЅС‚СѓСЂ РЅРµ Р·Р°РјРєРЅСѓС‚ вЂ” Р·Р°РјРєРЅС‘Рј."""
+    pts = list(points)
+    if closed and pts and _dist(pts[0], pts[-1]) > _POS_TOL:
+        pts.append(pts[0])
+    ms = _ms()
+    flat3d = _to_3d_flat(pts)
+    pl = ms.AddPolyline(aDouble(*flat3d))
+    try:
+        pl.Closed = closed
+    except Exception:
+        pass
+    if layer:
+        pl.Layer = layer
+    return {"ok": True, "handle": getattr(pl, "Handle", None)}
+
+def draw_rectangle(base: Tuple[float, float], width: float, height: float, layer: str | None = None, **kwargs):
+    x, y = float(base[0]), float(base[1])
+    w, h = float(width), float(height)
+    pts = [(x, y), (x + w, y), (x + w, y + h), (x, y + h)]
+    return draw_polyline(pts, layer=layer, closed=True)
+
+def draw_circle(center: Tuple[float, float], radius: float, layer: str | None = None, **kwargs):
+    ms = _ms()
+    c = ms.AddCircle(APoint(float(center[0]), float(center[1])), float(radius))
+    if layer:
+        c.Layer = layer
+    return {"ok": True, "handle": getattr(c, "Handle", None)}
+
+def zoom_extents(**kwargs):
+    acad = _get_acad()
+    time.sleep(0.2)
+    acad.app.ZoomExtents()
+    return {"ok": True}
+
+def save_as(path: str, **kwargs):
+    acad = _get_acad()
+    acad.doc.SaveAs(path)
+    return {"ok": True, "path": path}
+
+# =====================================================
+# Р§РўР•РќРР• / РђРќРђР›РРўРРљРђ / РљРћРќРўР•РљРЎРў
+# =====================================================
+
+def get_current_doc_info(retries: int = 10, sleep_sec: float = 0.2, **kwargs):
+    """РќР°РґС‘Р¶РЅРѕ РїРѕР»СѓС‡РёС‚СЊ РёРјСЏ/РїСѓС‚СЊ С‚РµРєСѓС‰РµРіРѕ DWG. Р”РѕР¶РёРґР°РµС‚СЃСЏ, РµСЃР»Рё РґРѕРєСѓРјРµРЅС‚ РµС‰С‘ РЅРµ РіРѕС‚РѕРІ."""
+    acad = _get_acad()
+    doc = None
+    last_err = None
+    for _ in range(retries):
+        try:
+            doc = acad.doc
+            if doc is not None and getattr(doc, "Name", None):
+                break
+            app = acad.app
+            if hasattr(app, "ActiveDocument"):
+                doc = app.ActiveDocument
+                if doc is not None and getattr(doc, "Name", None):
+                    break
+        except Exception as e:
+            last_err = e
+        time.sleep(sleep_sec)
+
+    if doc is None:
+        return {"ok": False, "error": f"no_active_document: {last_err}"}
+
+    info = {
+        "name": getattr(doc, "Name", None),
+        "fullpath": getattr(doc, "FullName", None),
+        "saved": bool(getattr(doc, "Saved", True)),
+    }
+    return {"ok": True, "doc": info}
+
+def list_layers(limit: int | None = None, **kwargs) -> Dict[str, Dict[str, Any]]:
+    acad = _get_acad()
+    layers = {}
+    count = acad.doc.Layers.Count
+    if limit is not None:
+        count = min(count, int(limit))
+    for i in range(count):
+        l = acad.doc.Layers.Item(i)
+        layers[l.Name] = {
+            "name": l.Name,
+            "on": getattr(l, "LayerOn", True),
+            "frozen": getattr(l, "Freeze", False),
+            "locked": getattr(l, "Lock", False),
+        }
+    return {"ok": True, "layers": layers}
+
+def list_entities(limit: int = 100,
+                  layer: str | None = None,
+                  type_contains: str | None = None,
+                  **kwargs):
+    ms = _ms()
+    res = []
+    count = 0
+    type_filter = (type_contains or "").lower()
+    for e in ms:
+        if layer and getattr(e, "Layer", None) != layer:
+            continue
+        if type_filter and type_filter not in _object_name(e).lower():
+            continue
+        res.append({
+            "handle": getattr(e, "Handle", None),
+            "type": _object_name(e),
+            "layer": getattr(e, "Layer", None),
+        })
+        count += 1
+        if count >= limit:
+            break
+    return {"ok": True, "entities": res}
+
+def get_extents_of_model(**kwargs):
+    """Р“СЂР°РЅРёС†С‹ РјРѕРґРµР»Рё РїРѕ С‚РёРїРѕРІС‹Рј РѕР±СЉРµРєС‚Р°Рј (Polyline/Line/Circle); РµСЃР»Рё СЃРѕРІСЃРµРј РїСѓСЃС‚Рѕ вЂ” ok=False."""
+    ms = _ms()
+    minx = miny = float("inf")
+    maxx = maxy = float("-inf")
+    any_found = False
+
+    for e in ms:
+        bbox = _get_bbox_entity(e)
+        if bbox:
+            any_found = True
+            (x1, y1, _), (x2, y2, _) = bbox
+            minx, miny = min(minx, x1), min(miny, y1)
+            maxx, maxy = max(maxx, x2), max(maxy, y2)
+
+    if not any_found:
+        return {"ok": False, "reason": "no_entities"}
+
+    return {"ok": True,
+            "min": (minx, miny),
+            "max": (maxx, maxy),
+            "center": ((minx + maxx) / 2.0, (miny + maxy) / 2.0)}
+
+def get_center_of_model(**kwargs):
+    ext = get_extents_of_model()
+    if not ext.get("ok"):
+        return {"ok": False, "reason": "empty_model"}
+    return {"ok": True, "center": ext["center"]}
+
+def snapshot_model(limit: int = 20,
+                   layer: str | None = None,
+                   type_contains: str | None = None,
+                   **kwargs):
+    """РЎРЅРёРјРѕРє РєРѕРЅС‚РµРєСЃС‚Р°: РґРѕРєСѓРјРµРЅС‚, СЌРєСЃС‚РµРЅС‚С‹, СЃР»РѕРё (РёРјРµРЅР°) Рё N РѕР±СЉРµРєС‚РѕРІ (С‚РёРї/СЃР»РѕР№/handle)."""
+    doc = get_current_doc_info()
+    ext = get_extents_of_model()
+    layers = list(list_layers().get("layers", {}).keys())
+    ents = list_entities(limit=limit, layer=layer, type_contains=type_contains).get("entities", [])
+    return {
+        "ok": True,
+        "doc": doc.get("doc"),
+        "extents": ext if ext.get("ok") else None,
+        "layers": layers,
+        "entities": ents,
+    }
+
+# =====================================================
+# РџРћРРЎРљ РњРќРћР“РћРЈР“РћР›Р¬РќРРљРћР’ / РљР’РђР”Р РђРўРћР’ РќР•Р—РђР’РРЎРРњРћ РћРў РўРРџРђ
+# =====================================================
+
+def _find_loops_from_lines(lines: List[Dict[str, Any]],
+                           pos_tol: float = _POS_TOL) -> List[List[Tuple[float, float]]]:
+    """
+    РЎРѕР±РёСЂР°РµС‚ Р·Р°РјРєРЅСѓС‚С‹Рµ РєРѕРЅС‚СѓСЂС‹ РёР· РЅР°Р±РѕСЂР° LINE (С‚РѕР»СЊРєРѕ 4-СЂРµР±РµСЂРЅС‹Рµ С†РёРєР»С‹).
+    Р’РѕР·РІСЂР°С‰Р°РµС‚ СЃРїРёСЃРѕРє РєРѕРЅС‚СѓСЂРѕРІ РєР°Рє СѓРїРѕСЂСЏРґРѕС‡РµРЅРЅС‹Рµ 4 С‚РѕС‡РєРё.
+    """
+    # РёР·РІР»РµРєР°РµРј СЃРµРіРјРµРЅС‚С‹
+    segs: List[Tuple[Tuple[float, float], Tuple[float, float]]] = []
+    for d in lines:
+        e = d["entity"]
+        try:
+            sp = e.StartPoint; ep = e.EndPoint
+            p1 = (float(sp[0]), float(sp[1]))
+            p2 = (float(ep[0]), float(ep[1]))
+            segs.append((p1, p2))
+        except Exception:
+            continue
+
+    # РіСЂР°С„ РїРѕ С‚РѕС‡РєР°Рј (СЃС…Р»РѕРїРЅРµРј Р±Р»РёР·РєРёРµ С‚РѕС‡РєРё)
+    # РЅРѕСЂРјР°Р»РёР·Р°С‚РѕСЂ С‚РѕС‡РєРё
+    def key_pt(p):
+        return (round(p[0]/pos_tol)*pos_tol, round(p[1]/pos_tol)*pos_tol)
+
+    adj: Dict[Tuple[float,float], Set[Tuple[float,float]]] = {}
+    for p1, p2 in segs:
+        k1, k2 = key_pt(p1), key_pt(p2)
+        adj.setdefault(k1, set()).add(k2)
+        adj.setdefault(k2, set()).add(k1)
+
+    loops: Set[Tuple[Tuple[float,float], ...]] = set()
+
+    # РґР»СЏ РєР°Р¶РґРѕРіРѕ СЂРµР±СЂР° вЂ” РїРѕРїСЂРѕР±СѓРµРј РѕР±РѕР№С‚Рё С†РёРєР» РґР»РёРЅРѕР№ 4
+    for p1, p2 in segs:
+        k1, k2 = key_pt(p1), key_pt(p2)
+        # РІСЃРµ СЃРѕСЃРµРґРё k2 (РєСЂРѕРјРµ k1)
+        for k3 in adj.get(k2, []):
+            if k3 == k1:
+                continue
+            # СЃРѕСЃРµРґРё k3, РєСЂРѕРјРµ k2
+            for k4 in adj.get(k3, []):
+                if k4 in (k2, k1):
+                    continue
+                # Р·Р°РјС‹РєР°РµС‚СЃСЏ Р»Рё РЅР° k1?
+                if k1 in adj.get(k4, []):
+                    quad = [k1, k2, k3, k4]
+                    # РЅРѕСЂРјР°Р»РёР·СѓРµРј РїРѕСЂСЏРґРѕРє (С‡С‚РѕР±С‹ РЅРµ Р»РѕРІРёС‚СЊ РґСѓР±Р»РёРєР°С‚С‹)
+                    # СЃРґРІРёРЅРµРј С‚Р°Рє, С‡С‚РѕР±С‹ РјРёРЅРёРјР°Р»СЊРЅР°СЏ Р»РµРєСЃРёРєРѕРіСЂР°С„РёС‡РµСЃРєРё С‚РѕС‡РєР° Р±С‹Р»Р° РїРµСЂРІРѕР№
+                    min_i = min(range(4), key=lambda i: quad[i])
+                    ordered = quad[min_i:] + quad[:min_i]
+                    loops.add(tuple(ordered))
+
+    # РїСЂРµРѕР±СЂР°Р·СѓРµРј РІ СЃРїРёСЃРєРё В«СЂРµР°Р»СЊРЅС‹С…В» С‚РѕС‡РµРє (РєР»СЋС‡Рё СѓР¶Рµ РѕРєСЂСѓРіР»РµРЅС‹)
+    res: List[List[Tuple[float, float]]] = []
+    for loop in loops:
+        pts = [(float(x), float(y)) for (x, y) in loop]
+        pts = _order_loop(pts)
+        res.append(pts)
+    return res
+
+def find_closed_polylines(layer: str | None = None,
+                          min_vertices: int = 3,
+                          min_area: float = 0.0,
+                          **kwargs):
+    """РќР°Р№С‚Рё Р·Р°РјРєРЅСѓС‚С‹Рµ РїРѕР»РёР»РёРЅРёРё (Polyline/LWPolyline). Р’РѕР·РІСЂР°С‰Р°РµС‚ РІРµСЂС€РёРЅС‹ Рё bbox."""
+    ms = _ms()
+    found = []
+    for e in ms:
+        name = _object_name(e)
+        if "polyline" not in name.lower():
+            continue
+        if layer and getattr(e, "Layer", None) != layer:
+            continue
+        if not _polyline_is_closed(e):
+            continue
+        verts2 = _polyline_vertices_2d_ordered(e)
+        if len(verts2) < min_vertices:
+            continue
+        area = _poly_area_xy(verts2)
+        if area < min_area:
+            continue
+        bbox = _bbox_from_points_2d(verts2)
+        found.append({
+            "handle": getattr(e, "Handle", None),
+            "layer": getattr(e, "Layer", None),
+            "vertices": verts2,
+            "area": area,
+            "bbox": bbox,
+        })
+    return {"ok": True, "polylines": found}
+
+def find_squares(layer: str | None = None,
+                 include_lines: bool = True,
+                 pos_tol: float = _POS_TOL,
+                 ang_tol_deg: float = _ANG_TOL_DEG,
+                 rel_len_tol: float = _REL_LEN_TOL,
+                 min_side: float = _MIN_SIDE,
+                 max_count: int = 2000,
+                 **kwargs):
+    """
+    РЈРЅРёРІРµСЂСЃР°Р»СЊРЅС‹Р№ РїРѕРёСЃРє РєРІР°РґСЂР°С‚РѕРІ:
+    - Р·Р°РјРєРЅСѓС‚С‹Рµ РїРѕР»РёР»РёРЅРёРё (Polyline/LWPolyline) СЃ 4 РІРµСЂС€РёРЅР°РјРё
+    - 4 СЃРѕРµРґРёРЅРµРЅРЅС‹Рµ LINE, РѕР±СЂР°Р·СѓСЋС‰РёРµ С†РёРєР»
+    - (РѕРїС†РёРѕРЅР°Р»СЊРЅРѕ) РіСЂСѓР±РѕРµ СЂР°СЃРїРѕР·РЅР°РІР°РЅРёРµ РїРѕ bbox РґСЂСѓРіРёС… СЃСѓС‰РЅРѕСЃС‚РµР№ вЂ” РІС‹РєР»СЋС‡РµРЅРѕ, С‡С‚РѕР±С‹ РЅРµ Р»РѕРІРёС‚СЊ Р»РѕР¶РЅС‹Рµ
+    Р’РѕР·РІСЂР°С‰Р°РµС‚ СЃРїРёСЃРѕРє:
+    {
+      "source": "polyline"|"lines",
+      "handles": [..],          # СЃСѓС‰РЅРѕСЃС‚Рё, РёР· РєРѕС‚РѕСЂС‹С… РєРІР°РґСЂР°С‚ СЃРѕР±СЂР°РЅ
+      "vertices": [(x,y),...],  # 4 РІРµСЂС€РёРЅС‹ РїРѕ РєРѕРЅС‚СѓСЂСѓ (РїРѕСЂСЏРґРѕРє)
+      "center": (cx,cy),
+      "side": S,
+      "bbox": ((minx,miny),(maxx,maxy))
+    }
+    """
+    ms = _ms()
+    squares: List[Dict[str, Any]] = []
+
+    # 1) РџРѕР»РёР»РёРЅРёРё
+    polys = find_closed_polylines(layer=layer, min_vertices=4, min_area=min_side*min_side).get("polylines", [])
+    for poly in polys:
+        vs = poly["vertices"]
+        if len(vs) == 4 and _is_square_vertices(vs, ang_tol_deg=ang_tol_deg, rel_len_tol=rel_len_tol, min_side=min_side):
+            center = _centroid(vs)
+            side = (_dist(vs[0], vs[1]) + _dist(vs[1], vs[2]) + _dist(vs[2], vs[3]) + _dist(vs[3], vs[0])) / 4.0
+            squares.append({
+                "source": "polyline",
+                "handles": [poly["handle"]],
+                "vertices": vs,
+                "center": center,
+                "side": side,
+                "bbox": poly["bbox"]
+            })
+            if len(squares) >= max_count:
+                return {"ok": True, "squares": squares}
+
+    # 2) Р›РѕРјР°РЅС‹Рµ РёР· LINE
+    if include_lines:
+        # СЃРѕР±РµСЂС‘Рј РІСЃРµ Р»РёРЅРёРё (Рё РїРѕ РЅСѓР¶РЅРѕРјСѓ СЃР»РѕСЋ, РµСЃР»Рё Р·Р°РґР°РЅ)
+        line_datas: List[Dict[str, Any]] = []
+        for e in ms:
+            if layer and getattr(e, "Layer", None) != layer:
+                continue
+            nm = _object_name(e).lower()
+            if "line" in nm and "polyline" not in nm:
+                line_datas.append({"entity": e, "handle": getattr(e, "Handle", None)})
+
+        loops = _find_loops_from_lines(line_datas, pos_tol=pos_tol)
+        for vs in loops:
+            if len(vs) == 4 and _is_square_vertices(vs, ang_tol_deg=ang_tol_deg, rel_len_tol=rel_len_tol, min_side=min_side):
+                center = _centroid(vs)
+                side = (_dist(vs[0], vs[1]) + _dist(vs[1], vs[2]) + _dist(vs[2], vs[3]) + _dist(vs[3], vs[0])) / 4.0
+                bbox = _bbox_from_points_2d(vs)
+                # handles РґР»СЏ Р»РёРЅРёР№ вЂ” РЅРµ С‚СЂРµРєР°РµРј С‚РѕС‡РЅРѕ РєР°РєРёРµ 4 РґР°Р»Рё СЌС‚РѕС‚ Р»СѓРї (РґРѕСЂРѕРіРѕ),
+                # РЅРѕ РјРѕР¶РЅРѕ РїСЂРёР±Р»РёР·РёС‚РµР»СЊРЅРѕ СЃРѕР±СЂР°С‚СЊ Р»СЋР±С‹Рµ 4, РєРѕС‚РѕСЂС‹Рµ СЃРѕРµРґРёРЅСЏСЋС‚СЃСЏ РІ СЌС‚Рё РІРµСЂС€РёРЅС‹ (СѓРїСЂРѕС‰С‘РЅРЅРѕ РїСЂРѕРїСѓСЃС‚РёРј)
+                squares.append({
+                    "source": "lines",
+                    "handles": [],
+                    "vertices": vs,
+                    "center": center,
+                    "side": side,
+                    "bbox": bbox
+                })
+                if len(squares) >= max_count:
+                    return {"ok": True, "squares": squares}
+
+    return {"ok": True, "squares": squares}
+
+def pick_largest_closed_polyline(layer: str | None = None, **kwargs):
+    res = find_closed_polylines(layer=layer, min_vertices=3, min_area=_MIN_SIDE * _MIN_SIDE)
+    polys = res.get("polylines", [])
+    if not polys:
+        return {"ok": False, "reason": "no_closed_polylines"}
+    polys.sort(key=lambda p: p.get("area", 0.0), reverse=True)
+    return {"ok": True, "polyline": polys[0]}
+
+def measure_bbox_of_largest_closed(layer: str | None = None, **kwargs):
+    pick = pick_largest_closed_polyline(layer=layer)
+    if not pick.get("ok"):
+        return {"ok": False, "reason": pick.get("reason")}
+    bbox = pick["polyline"]["bbox"]
+    (minx, miny), (maxx, maxy) = bbox
+    return {"ok": True, "min": (minx, miny), "max": (maxx, maxy),
+            "width": maxx - minx, "height": maxy - miny,
+            "center": ((minx + maxx)/2.0, (miny + maxy)/2.0)}
+
+# =====================================================
+# Р”Р•Р™РЎРўР’РРЇ РќРђР” Р“Р•РћРњР•РўР РР•Р™ Р’Р«РЎРћРљРћР“Рћ РЈР РћР’РќРЇ
+# =====================================================
+
+def inscribe_circles_in_squares(layer_name: str = "CIRCLES_YELLOW",
+                                color: Any = 2,
+                                layer_filter: str | None = None,
+                                pos_tol: float = _POS_TOL,
+                                ang_tol_deg: float = _ANG_TOL_DEG,
+                                rel_len_tol: float = _REL_LEN_TOL,
+                                min_side: float = _MIN_SIDE,
+                                max_count: int = 2000,
+                                **kwargs):
+    """
+    РќР°С…РѕРґРёС‚ РєРІР°РґСЂР°С‚С‹ РІ РјРѕРґРµР»Рё (РЅРµР·Р°РІРёСЃРёРјРѕ РѕС‚ С‚РѕРіРѕ, РїРѕР»РёР»РёРЅРёСЏ СЌС‚Рѕ РёР»Рё РЅР°Р±РѕСЂ Р»РёРЅРёР№)
+    Рё РІРїРёСЃС‹РІР°РµС‚ РІ РєР°Р¶РґС‹Р№ РѕРєСЂСѓР¶РЅРѕСЃС‚СЊ РІ СЃР»РѕР№ layer_name.
+    """
+    ensure_layer(layer_name, color=color)
+    try:
+        set_current_layer(layer_name)
+    except Exception:
+        pass
+
+    found = find_squares(layer=layer_filter,
+                         include_lines=True,
+                         pos_tol=pos_tol,
+                         ang_tol_deg=ang_tol_deg,
+                         rel_len_tol=rel_len_tol,
+                         min_side=min_side,
+                         max_count=max_count)
+    if not found.get("ok"):
+        return {"ok": False, "reason": "find_squares_failed"}
+
+    inserted = 0
+    for sq in found["squares"]:
+        c = sq["center"]
+        r = sq["side"] / 2.0
+        try:
+            draw_circle(c, r, layer=layer_name)
+            inserted += 1
+        except Exception:
+            # РЅРµ СЃРїРѕС‚С‹РєР°РµРјСЃСЏ РѕР± РѕРґРёРЅ РЅРµСѓРґР°С‡РЅС‹Р№ РєСЂСѓРі
+            pass
+
+    return {"ok": True, "inserted": inserted, "layer": layer_name}
+
+def draw_triangle_roof_over_largest_square(layer_source: str | None = None,
+                                           layer_result: str | None = None,
+                                           height_ratio: float = 0.5,
+                                           overhang: float = 0.0,
+                                           **kwargs):
+    """
+    РќР°С…РѕРґРёС‚ СЃР°РјСѓСЋ Р±РѕР»СЊС€СѓСЋ Р·Р°РјРєРЅСѓС‚СѓСЋ РїРѕР»РёР»РёРЅРёСЋ (РѕР±С‹С‡РЅРѕ РєРІР°РґСЂР°С‚),
+    Р±РµСЂС‘С‚ РµС‘ bbox Рё СЃС‚СЂРѕРёС‚ С‚СЂРµСѓРіРѕР»СЊРЅСѓСЋ "РєСЂС‹С€Сѓ" РЅР°Рґ РІРµСЂС…РЅРµР№ СЃС‚РѕСЂРѕРЅРѕР№.
+    height_ratio вЂ” РІС‹СЃРѕС‚Р° РєСЂС‹С€Рё РІ РґРѕР»СЏС… РІС‹СЃРѕС‚С‹;
+    overhang вЂ” СЃРІРµСЃ РїРѕ X СЃ РєР°Р¶РґРѕР№ СЃС‚РѕСЂРѕРЅС‹.
+    """
+    pick = pick_largest_closed_polyline(layer=layer_source)
+    if not pick.get("ok"):
+        return {"ok": False, "reason": "no_base_poly"}
+
+    bbox = pick["polyline"]["bbox"]
+    if not bbox:
+        return {"ok": False, "reason": "no_bbox"}
+
+    (minx, miny), (maxx, maxy) = bbox
+    h = maxy - miny
+    apex_h = h * float(height_ratio)
+
+    x_left = minx - float(overhang)
+    x_right = maxx + float(overhang)
+    y_top = maxy
+    x_mid = (minx + maxx) / 2.0
+    apex = (x_mid, y_top + apex_h)
+
+    pts = [(x_left, y_top), (x_right, y_top), apex, (x_left, y_top)]
+    return draw_polyline(pts, layer=layer_result or layer_source, closed=True)
+
+def draw_from_model_center(shape: str = "circle",
+                           size: float = 1000.0,
+                           layer: str | None = None,
+                           **kwargs):
+    """Р РёСЃСѓРµРј С„РёРіСѓСЂСѓ РѕС‚ С†РµРЅС‚СЂР° С‚РµРєСѓС‰РµР№ РјРѕРґРµР»Рё (РїСЂРёРјРµСЂ РєРѕРЅС‚РµРєСЃС‚РЅРѕРіРѕ РґРµР№СЃС‚РІРёСЏ)."""
+    c = get_center_of_model()
+    if not c.get("ok"):
+        return {"ok": False, "reason": "empty_model"}
+    cx, cy = c["center"]
+    if shape.lower() == "circle":
+        return draw_circle((cx, cy), size/2.0, layer=layer)
+    if shape.lower() == "square":
+        half = size / 2.0
+        return draw_rectangle((cx - half, cy - half), size, size, layer=layer)
+    return {"ok": False, "reason": "unknown_shape"}
+
+# =====================================================
+# РЈР”РђР›Р•РќРР• / РћР§РРЎРўРљРђ
+# =====================================================
+
+def erase_by_handles(handles: List[str], **kwargs):
+    acad = _get_acad()
+    count = 0
+    for h in handles:
+        if not h:
+            continue
+        try:
+            e = acad.doc.HandleToObject(h)
+            e.Delete()
+            count += 1
+        except Exception:
+            pass
+    return {"ok": True, "deleted": count}
+
+def erase_all_on_layer(layer: str, **kwargs):
+    ms = _ms()
+    handles = []
+    for e in ms:
+        if getattr(e, "Layer", None) == layer:
+            handles.append(getattr(e, "Handle", None))
+    return erase_by_handles(handles)
+
+def erase_by_filter(type_contains: str | None = None,
+                    layer: str | None = None,
+                    limit: Optional[int] = None,
+                    **kwargs):
+    ms = _ms()
+    handles: List[str] = []
+    for e in ms:
+        if type_contains and type_contains.lower() not in _object_name(e).lower():
+            continue
+        if layer and getattr(e, "Layer", None) != layer:
+            continue
+        handles.append(getattr(e, "Handle", None))
+        if limit and len(handles) >= limit:
+            break
+    return erase_by_handles(handles)
+
+# ===== FILE: C:\Users\mill4\Рабочий стол\AI Agent\agent\tools\init.py =====
+
+from . import acad as _acad
+from . import swmm as _swmm
+
+TOOLS = {
+    "acad.ensure_layer": _acad.ensure_layer,
+    "acad.draw_line": _acad.draw_line,
+    "acad.draw_polyline": _acad.draw_polyline,
+    "acad.zoom_extents": _acad.zoom_extents,
+    "swmm.run_cli": _swmm.run_cli,
+}
+
+# ===== FILE: C:\Users\mill4\Рабочий стол\AI Agent\agent\tools\swmm.py =====
+
+import os, subprocess
+from ..config import SWMM_EXE
+
+def run_cli(inp_path: str, rpt_path: str = None, out_path: str = None):
+    if not rpt_path:
+        rpt_path = os.path.splitext(inp_path)[0] + ".rpt"
+    if not out_path:
+        out_path = os.path.splitext(inp_path)[0] + ".out"
+    cmd = [SWMM_EXE, inp_path, rpt_path, out_path]
+    subprocess.run(cmd, check=True)
+    return {"ok": True, "rpt": rpt_path, "out": out_path}
+
+# ===== FILE: C:\Users\mill4\Рабочий стол\AI Agent\agent\utils\ui.py =====
+
+import time
+from pywinauto import Desktop
+from pywinauto.keyboard import send_keys
+
+def focus_by_exe(exe_substr: str, timeout=20):
+    desk = Desktop(backend="uia")
+    t0 = time.time()
+    exe_substr = exe_substr.lower()
+    while time.time() - t0 < timeout:
+        for w in desk.windows():
+            try:
+                pid = w.process_id()
+                name = w.element_info.process_id  # dummy touch
+                proc_name = w.app.process
+            except:
+                pass
+        for w in desk.windows():
+            try:
+                if exe_substr in (w.app.process_module or "").lower():
+                    w.set_focus()
+                    return True
+            except:
+                pass
+        time.sleep(0.5)
+    return False
+
+def type_text(text: str, delay: float = 0.03):
+    for ch in text:
+        send_keys(ch)
+        time.sleep(delay)
+    time.sleep(0.05)
+
+def press_enter():
+    send_keys("{ENTER}")
+
+# ===== FILE: C:\Users\mill4\Рабочий стол\AI Agent\agent\utils\watchdog.py =====
+
+import time, threading
+from pywinauto import Desktop
+from pywinauto.keyboard import send_keys
+
+KEYWORDS = ["error", "РѕС€РёР±РєР°", "warning", "license", "update", "РґРѕРІРµСЂСЏРµС‚Рµ", "save", "СЃРѕС…СЂР°РЅРёС‚СЊ"]
+
+def _try_close(win):
+    title = (win.window_text() or "").lower()
+    if any(k in title for k in KEYWORDS):
+        for label in ["OK","Yes","Р”Р°","РћРљ","Close","Р—Р°РєСЂС‹С‚СЊ","Cancel","РћС‚РјРµРЅР°"]:
+            try:
+                btn = win.child_window(title=label, control_type="Button")
+                if btn.exists(): btn.click_input(); return True
+            except: pass
+        send_keys("{ESC}"); return True
+    return False
+
+def start_watchdog(stop_event, reporter=print):
+    def loop():
+        desk = Desktop(backend="uia")
+        while not stop_event.is_set():
+            try:
+                for w in desk.windows():
+                    try:
+                        if _try_close(w):
+                            reporter(f"[watchdog] Р—Р°РєСЂС‹С‚ РґРёР°Р»РѕРі: {w.window_text()!r}")
+                    except: pass
+            except: pass
+            time.sleep(0.5)
+    t = threading.Thread(target=loop, daemon=True)
+    t.start()
+    return t
